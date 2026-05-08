@@ -8,8 +8,6 @@ meta:
 common:
 	ADDON_DEPENDENCIES = ofxGCode ofxGrbl ofxSvg
 
-	ADDON_INCLUDES += $(OF_ROOT)/addons
-
 linux64:
 vs:
 linuxarmv6l:
