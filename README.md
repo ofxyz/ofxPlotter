@@ -2,6 +2,8 @@
 
 Pen-plotter toolchain for openFrameworks. Converts raster images into mm-space toolpaths using several artistic Path Finding Modules (PFMs), manages multi-layer pen jobs, and exports plotter-aware G-code for GRBL-based machines.
 
+![preview](example-kit/preview.png)
+
 ## Features
 
 - **Five PFMs** — Sketch Lines, Cross-Hatch, Spiral, Stippling, Contours
@@ -259,11 +261,5 @@ Full image-to-plotter workflow with an ofxKit ImGui UI. Three dockable panels:
 - **Preview** — live vector preview of the generated paths, scaled to fit, drawn directly into an ImGui DrawList. Paths are colour-coded per layer.
 
 The **Plotter** menu bar group provides feed hold, queue pause/resume, and clear, mirroring the controls in the serial window.
-
-Dependencies: `ofxKit`, `ofxPlotter`, `ofxGrbl`, `ofxGrblKit`.
-
-### `example_random_walk`
-
-Live streaming random walk to a connected GRBL plotter (or simulation mode). Demonstrates `PenSettings`, `ofxGrbl` queue management, and `ofxGrblKit`'s serial/machine UI window. The pen never lifts between whole segments — it just picks a new heading at each boundary and carries on, keeping the GRBL queue topped up to avoid stalls.
 
 Dependencies: `ofxKit`, `ofxPlotter`, `ofxGrbl`, `ofxGrblKit`.

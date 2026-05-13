@@ -1,0 +1,27 @@
+{
+  "backgroundAuto": true,
+  "bgA": 255,
+  "bgB": 24,
+  "bgG": 18,
+  "bgR": 18,
+  "circleRes": 22,
+  "depthTest": false,
+  "lineWidth": 1.0,
+  "logLevel": 1,
+  "rulerScale": 1.0,
+  "smoothLighting": true,
+  "targetFps": 60,
+  "vsync": true,
+  "windowVisibility": {
+    "ofxkit.window.code_editor": false,
+    "ofxkit.window.image_settings": false,
+    "ofxkit.window.path_editor": false,
+    "ofxkit.window.preferences": false,
+    "ofxkit.window.preview": false,
+    "ofxkit.window.properties": true,
+    "ofxkit.window.scene": true,
+    "ofxkit.window.serial_machine": false,
+    "ofxkit.window.shortcuts": false,
+    "ofxkit.window.toolbar": true
+  }
+}
