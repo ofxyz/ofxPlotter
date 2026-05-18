@@ -4,154 +4,30 @@
 //  Image-to-toolpath engine for pen plotters.
 //  Converts a raster image into vector paths (polylines) using
 //  various Path Finding Modules (PFMs) inspired by DrawingBotV3.
-//  Supports multi-layer output with per-layer brush/color.
+//  Supports multi-layer output with per-layer brush/colour.
+//
+//  Layers are stored as ECS entities in an internal entt::registry.
+//  Each layer entity carries:
+//    ecs::layer_component          — name, visible, locked, colour, sort index
+//    ecs::Relationship             — parent / child hierarchy
+//    plotter::settings_component   — PFM type + all algorithm settings
+//    plotter::paths_component      — generated ofPath strokes
+//    plotter::toolpath_stats_component — cached stats (paths, points, distance, time)
 //
 
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
-#include "ofMain.h"
+#include "PlotterComponents.h"
 #include "PenSettings.h"
+#include <ofxEnTTKit/src/components/layer_components.h>
+#include <ofxEnTTKit/src/components/hierarchy_components.h>
+#include <entt.hpp>
 #include <vector>
 #include <string>
 #include <functional>
 #include <algorithm>
-
-// =============================================================
-// Enums
-// =============================================================
-
-enum class PaperSize {
-    A4,     // 297 x 210 mm
-    A3,     // 420 x 297 mm
-    A2,     // 594 x 420 mm
-    A1,     // 841 x 594 mm
-    A0,     // 1189 x 841 mm
-    Custom
-};
-
-enum class PaperOrientation {
-    Portrait,
-    Landscape
-};
-
-enum class PFMType {
-    SketchLines,
-    CrossHatch,
-    Spiral,
-    Stippling,
-    Contours
-};
-
-enum class BrushShape {
-    Round,
-    Square,
-    Flat,       // Calligraphy-style flat nib
-    Nib,        // Italic nib at angle
-    Custom      // User-drawn outline
-};
-
-// =============================================================
-// PFM-specific settings  (must be before PlotterLayer)
-// =============================================================
-
-struct SketchLinesSettings {
-    float lineMinLength  = 5.0f;
-    float lineMaxLength  = 80.0f;
-    int   angleTests     = 18;
-    float lineDensity    = 75.0f;
-    float eraseMin       = 50.0f;
-    float eraseMax       = 125.0f;
-    int   squiggleMin    = 3;
-    int   squiggleMax    = 200;
-    bool  shouldLiftPen  = true;
-    float plotResolution = 0.5f;
-};
-
-struct CrossHatchSettings {
-    float angle1        = 45.0f;
-    float angle2        = 135.0f;
-    bool  useSecondary  = true;
-    float lineSpacing   = 2.0f;
-    float minBrightness = 0.0f;
-};
-
-struct SpiralSettings {
-    float ringSpacing = 3.0f;
-    float amplitude   = 1.0f;
-    float velocity    = 5.0f;
-    float centreX     = 50.0f;
-    float centreY     = 50.0f;
-    float spiralSize  = 100.0f;
-    bool  ignoreWhite = true;
-};
-
-struct StipplingSettings {
-    float dotSpacingMin = 0.5f;
-    float dotSpacingMax = 5.0f;
-    float dotRadius     = 0.2f;
-    int   iterations    = 50;
-};
-
-struct ContourSettings {
-    float cannyLow      = 50.0f;
-    float cannyHigh     = 150.0f;
-    float minContourLen = 5.0f;
-};
-
-// =============================================================
-// Brush preset (pen tip definition)
-// =============================================================
-
-struct BrushPreset {
-    std::string name     = "0.3mm Round";
-    BrushShape  shape    = BrushShape::Round;
-    float sizeMM         = 0.3f;
-    float angle          = 0.0f;
-    float flatRatio      = 0.3f;
-    float softness       = 0.0f;
-    ofColor color        = ofColor(0, 0, 0);
-    std::vector<glm::vec2> customOutline;
-};
-
-// =============================================================
-// Plotter Layer
-// =============================================================
-
-struct PlotterLayer {
-    std::string name      = "Layer 1";
-    bool visible          = true;
-    bool locked           = false;
-    int  brushIndex       = 0;
-    ofColor color         = ofColor(0, 0, 0);
-
-    PFMType pfmType       = PFMType::SketchLines;
-    SketchLinesSettings sketchLines;
-    CrossHatchSettings  crossHatch;
-    SpiralSettings      spiral;
-    StipplingSettings   stippling;
-    ContourSettings     contours;
-
-    std::vector<ofPolyline> paths;
-    int   totalPaths    = 0;
-    int   totalPoints   = 0;
-    float totalDistance  = 0.0f;
-    float estimatedTime = 0.0f;
-};
-
-// =============================================================
-// Image preprocessing settings
-// =============================================================
-
-struct PreprocessSettings {
-    float brightness = 0.0f;
-    float contrast   = 0.0f;
-    float threshold  = -1.0f;
-    bool  invert     = false;
-    float blur       = 0.0f;
-    bool  edgeDetect = false;
-};
 
 // =============================================================
 // ImageToPath - Main engine
@@ -165,36 +41,103 @@ public:
     void setImage(const ofPixels& pixels);
     bool hasImage() const { return m_sourceLoaded; }
 
-    // Load an SVG and push its outlines into the active layer as mm-space
-    // polylines, fitted to the current paperSize / marginMM. Unlike loadImage
-    // there is no raster source and no PFM step -- the vector data IS the
-    // plot, so after this call the user can go straight to Export / Print.
-    // The SVG's own viewbox y-axis (down) is preserved so the preview matches
-    // what designers see in Illustrator / Inkscape; the plotter viewer's
-    // "Y+ up" toggle can still flip it for GRBL convention.
-    bool loadVectorSVG(const std::string& path);
+    // ---- SVG import ----
+    enum class SvgImportMode {
+        GroupsAsLayers,   ///< one ECS layer per top-level SVG <g> (default)
+        ColorsAsLayers,   ///< one ECS layer per unique stroke/fill colour
+        SingleLayer       ///< all paths in the active layer (legacy)
+    };
+
+    /// Load an SVG and distribute its outlines into ECS layers according to
+    /// mode, fitted to the current paperSize / marginMM.
+    bool loadVectorSVG(const std::string& path,
+                       SvgImportMode mode = SvgImportMode::GroupsAsLayers);
+
+    /// Returns true when a colour preview of the last loaded SVG is available.
+    bool hasSvgPreview() const { return m_svgPreview.isAllocated() && m_svgPreview.getWidth() > 0; }
+
+    /// Colour preview image rendered from the fitted SVG paths (filled shapes
+    /// use their original fill colour; open paths are drawn as lines).
+    /// Dimensions match the draw area in the current paper space.
+    const ofImage& getSvgPreview() const { return m_svgPreview; }
+
+    /// Re-render the SVG colour preview into m_svgPreview.  Called
+    /// automatically by loadVectorSVG; call again if you change paper / margin.
+    /// Must be called on the main/GL thread.  pixelsPerMM controls resolution.
+    void renderSvgColorPreview(float pixelsPerMM = 3.f);
 
     const ofImage& getSourceImage() const { return m_sourceImage; }
     const ofImage& getWorkingImage() const { return m_workingImage; }
 
-    /// Upload the processed pixel buffer to the working image GPU texture.
-    /// Call this from the main thread after generate() completes if you want
-    /// to display getWorkingImage() in a UI. generate() itself no longer does
-    /// GPU uploads so it is safe to call from a background thread.
     void uploadWorkingImageTexture() {
-        if (m_workW > 0 && m_workH > 0) {
+        if (m_workW > 0 && m_workH > 0)
             m_workingImage.setFromPixels(m_workingPixels);
-        }
     }
 
     void generate(std::function<void(float, const std::string&)> onProgress = nullptr);
-    void generateLayer(int layerIdx, std::function<void(float, const std::string&)> onProgress = nullptr);
+    void generateLayer(entt::entity layerEntity,
+        std::function<void(float, const std::string&)> onProgress = nullptr);
 
-    const std::vector<ofPolyline>& getPaths() const { return m_flatPaths; }
+    /// Returns true if at least one layer has fill_raster_component::enabled
+    /// and a non-empty raster cache (i.e. rasterizeLayerFills has been called).
+    bool hasFillLayers() const;
+
+    /// Render each fill-enabled layer's closed paths into a greyscale bitmap
+    /// using each path's colour luminance as fill intensity.  Must be called
+    /// on the main/GL thread before starting the generate worker thread.
+    /// @param pixelsPerMM  Raster resolution (default 10 px/mm).
+    void rasterizeLayerFills(float pixelsPerMM = 10.f);
+
+    const std::vector<ofPolyline>&   getPaths()            const { return m_flatPaths; }
+    const std::vector<entt::entity>& getFlatPathEntities() const { return m_flatPathLayerEntity; }
+    const std::vector<ofColor>&      getFlatPathColors()   const { return m_flatPathColors; }
     void rebuildFlatPaths();
 
     glm::vec2 getPaperSizeMM() const;
-    ofColor getPathColor(int flatIdx) const;
+    ofColor   getPathColor(int flatIdx) const;
+
+    /// Rescale all loaded layer paths so they fill the drawable area
+    /// (paper minus margins) while preserving aspect ratio.
+    void scaleToFit();
+
+    // ---- Post-load path transforms ----
+    /// Mirror all paths horizontally around the horizontal centre of the draw area.
+    void flipHorizontal();
+    /// Mirror all paths vertically around the vertical centre of the draw area.
+    void flipVertical();
+    /// Rotate all paths 90° clockwise.  Swaps draw-area width/height and
+    /// re-centres in the paper so the content stays inside the margins.
+    void rotate90CW();
+    /// Rotate all paths 90° counter-clockwise.
+    void rotate90CCW();
+
+    // ---- Draw-area rect (mm, relative to paper origin) ----
+    /// The rectangle within the paper that the image is mapped to.
+    /// Paths are generated in this same coordinate space.
+    struct DrawAreaMM { float x = 0, y = 0, w = 0, h = 0; };
+    DrawAreaMM getDrawAreaMM() const {
+        if (m_drawWidth > 0.f && m_drawHeight > 0.f)
+            return { m_drawOffsetX, m_drawOffsetY, m_drawWidth, m_drawHeight };
+        if (!m_sourceLoaded || m_sourceImage.getWidth() <= 0 || m_sourceImage.getHeight() <= 0)
+            return {};
+        glm::vec2 paper  = getPaperSizeMM();
+        float     availW = paper.x - 2.f * marginMM;
+        float     availH = paper.y - 2.f * marginMM;
+        if (availW <= 0.f || availH <= 0.f) return {};
+        float aspect = (float)m_sourceImage.getWidth() / (float)m_sourceImage.getHeight();
+        float dw, dh;
+        if (aspect > availW / availH) { dw = availW; dh = availW / aspect; }
+        else                          { dh = availH; dw = availH * aspect; }
+        return { marginMM + (availW - dw) * 0.5f,
+                 marginMM + (availH - dh) * 0.5f,
+                 dw, dh };
+    }
+
+    // ---- Image overlay transform (mm, relative to paper origin) ----
+    /// Initialised from getDrawAreaMM() after every load.
+    /// Can be edited live via the 2D transform handle in the preview.
+    float imageOverlayX {0}, imageOverlayY {0};
+    float imageOverlayW {0}, imageOverlayH {0};
 
     // ---- Settings (public for UI binding) ----
     PaperSize        paperSize        = PaperSize::A3;
@@ -202,32 +145,76 @@ public:
     float            customWidth      = 420.0f;
     float            customHeight     = 297.0f;
     float            marginMM         = 10.0f;
+    ofColor          canvasColor      {255, 255, 255};  ///< paper/substrate background colour
 
     PenSettings        pen;
     PreprocessSettings preprocess;
 
-    // ---- Layers ----
-    std::vector<PlotterLayer> layers;
-    int currentLayer = 0;
+    // ---- ECS layer store ----
+    /// Registry owns all layer entities.  External code may read components
+    /// directly for rendering or UI; mutating operations should use the
+    /// add/remove/generate helpers to keep layerOrder in sync.
+    entt::registry            registry;
 
-    PlotterLayer& getActiveLayer();
-    const PlotterLayer& getActiveLayer() const;
-    int addLayer(const std::string& name = "");
-    void removeLayer(int idx);
+    /// Ordered list of layer entities (bottom-first, matching render order).
+    /// EnTT storage order is undefined, so this vector is the canonical order.
+    std::vector<entt::entity> layerOrder;
+
+    /// The layer entity currently selected for editing / generation.
+    entt::entity activeLayer = entt::null;
+
+    /// Convenience accessors for the active layer's components.
+    plotter::settings_component& getActiveSettings();
+    const plotter::settings_component& getActiveSettings() const;
+    ecs::layer_component& getActiveLayerComponent();
+    const ecs::layer_component& getActiveLayerComponent() const;
+
+    /// Layer CRUD — keeps layerOrder (DFS cache) and Relationship links in sync.
+    entt::entity addLayer(const std::string& name = "",
+                          entt::entity parent = entt::null);
+    void         removeLayer(entt::entity e);
+
+    /// Rewire an entity's position in the hierarchy then rebuild layerOrder.
+    /// @param child        Entity to move.
+    /// @param newParent    New parent (entt::null = root level).
+    /// @param insertBefore Sibling to insert before (entt::null = append last).
+    void         reparentLayer(entt::entity child,
+                               entt::entity newParent,
+                               entt::entity insertBefore);
 
     // ---- Brush library ----
     std::vector<BrushPreset> brushes;
     int addBrush(const BrushPreset& b);
 
-    // ---- Aggregate stats (across all layers) ----
-    int   totalPaths     = 0;
-    int   totalPoints    = 0;
-    float totalDistance   = 0.0f;
-    float estimatedTime  = 0.0f;
+    // ---- Aggregate stats (across all visible layers) ----
+    int   totalPaths    = 0;
+    int   totalPoints   = 0;
+    float totalDistance = 0.0f;
+    float estimatedTime = 0.0f;
 
 private:
+    /// Rebuild layerOrder from a depth-first walk of the Relationship tree.
+    void rebuildLayerOrder();
+
+    /// True if the entity AND all its ancestors are visible.
+    bool isEffectivelyVisible(entt::entity e) const;
+
+    /// Append `child` as the last item in `parent`'s child list (or the root
+    /// sibling chain when parent == entt::null). Assumes `child` already has an
+    /// ecs::Relationship component and is fully unlinked.
+    static void linkChild(entt::registry& reg,
+                          entt::entity parent, entt::entity child);
+
+    /// Remove `entity` from its parent's child list (or the root sibling chain),
+    /// fixing all prev/next pointers. Does NOT recurse into descendants.
+    static void unlinkChild(entt::registry& reg, entt::entity entity);
+
+    /// Apply a 2-D vertex transform to every path on every layer, then
+    /// rebuild flat paths, recompute stats, and refresh the SVG preview.
+    void applyPathTransform(std::function<glm::vec2(glm::vec2)> xform);
+
     void preprocessImage();
-    void runLayerGeneration(PlotterLayer& layer,
+    void runLayerGeneration(entt::entity layerEntity,
         std::function<void(float, const std::string&)> onProgress);
     void runSketchLines(std::function<void(float, const std::string&)> onProgress);
     void runCrossHatch(std::function<void(float, const std::string&)> onProgress);
@@ -242,14 +229,17 @@ private:
     ofImage  m_sourceImage;
     ofImage  m_workingImage;
     ofPixels m_workingPixels;
-    bool m_sourceLoaded = false;
+    bool     m_sourceLoaded = false;
+
+    ofImage  m_svgPreview;   ///< colour preview rendered from fitted SVG paths
 
     // Scratch buffer used by PFM methods during generation
     std::vector<ofPolyline> m_paths;
 
-    // Flat path list across all visible layers
-    std::vector<ofPolyline> m_flatPaths;
-    std::vector<int>        m_flatPathLayerIdx;
+    // Flat path list across all visible layers (for preview + full G-code export)
+    std::vector<ofPolyline>   m_flatPaths;
+    std::vector<entt::entity> m_flatPathLayerEntity;  ///< parallel to m_flatPaths
+    std::vector<ofColor>      m_flatPathColors;        ///< per-flat-path colour; SVG import sets individual colours, PFM falls back to layer colour
 
     // Working image dimensions mapped to drawing area
     float m_drawWidth   = 0;
@@ -258,4 +248,8 @@ private:
     float m_drawOffsetY = 0;
     int m_workW = 0;
     int m_workH = 0;
+
+    // Entity currently being generated (set temporarily during runLayerGeneration
+    // so PFM methods can read from registry.get<settings_component>(m_genEntity))
+    entt::entity m_genEntity = entt::null;
 };

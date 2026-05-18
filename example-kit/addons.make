@@ -5,3 +5,4 @@ ofxImGuizmo
 ofxPlotter
 ofxGrbl
 ofxGrblKit
+ofxAssimpModelLoader

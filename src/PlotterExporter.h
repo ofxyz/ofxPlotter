@@ -21,8 +21,8 @@ namespace plotter {
 /// Build a full G-code program for all visible layers in @p engine.
 std::string toGCode(const ImageToPath& engine);
 
-/// Build a G-code program for a single layer (by index) in @p engine.
-/// Returns an empty string if @p layerIdx is out of range.
-std::string toGCodeForLayer(const ImageToPath& engine, int layerIdx);
+/// Build a G-code program for a single layer entity in @p engine.
+/// Returns an empty string if @p layerEntity is invalid.
+std::string toGCodeForLayer(const ImageToPath& engine, entt::entity layerEntity);
 
 } // namespace plotter

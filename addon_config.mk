@@ -6,7 +6,7 @@ meta:
 	ADDON_URL =
 
 common:
-	ADDON_DEPENDENCIES = ofxGCode ofxGrbl ofxSvg
+	ADDON_DEPENDENCIES = ofxGCode ofxGrbl ofxSvg ofxKit ofxEnTTKit ofxEnTTInspector
 
 linux64:
 vs:

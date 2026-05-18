@@ -1,0 +1,21 @@
+{
+    "baudRate": 115200,
+    "capabilities": {
+        "supportsDollarSettings": true,
+        "supportsGrblJog": true,
+        "supportsJogCancel": true,
+        "supportsM114Position": false,
+        "supportsM115FirmwareInfo": false,
+        "supportsRealtimeStatusQuery": true
+    },
+    "envelope": {
+        "maxX": 420.0,
+        "maxY": 297.0,
+        "maxZ": 40.0,
+        "minX": 0.0,
+        "minY": 0.0,
+        "minZ": -10.0
+    },
+    "profile": "grbl",
+    "serialDevicePath": ""
+}
