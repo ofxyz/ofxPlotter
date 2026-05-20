@@ -3,7 +3,7 @@
 //  PlotterComponents.h
 //  Domain types and ECS components for ofxPlotter.
 //
-//  Enums, PFM-settings structs, BrushPreset, and PreprocessSettings are all
+//  Enums, finder-settings structs, BrushPreset, and PreprocessSettings are all
 //  defined here so that both ImageToPath (the engine) and the ECS components
 //  (plotter:: namespace) can include this single header without circular deps.
 //
@@ -34,7 +34,8 @@ enum class PaperOrientation {
     Landscape
 };
 
-enum class PFMType {
+/// Image-to-stroke algorithm selection (plot finder).
+enum class PlotFinderType {
     SketchLines,
     CrossHatch,
     Spiral,
@@ -51,7 +52,7 @@ enum class BrushShape {
 };
 
 // =============================================================
-// PFM-specific settings
+// Plot-finder-specific settings
 // =============================================================
 
 struct SketchLinesSettings {
@@ -133,7 +134,7 @@ struct PreprocessSettings {
 namespace plotter {
 
 /// Toolpath geometry stored on a layer entity.
-/// PFMs write to a scratch ofPolyline buffer during generation; the engine
+/// Plot finders write to a scratch ofPolyline buffer during generation; the engine
 /// converts and moves the result here once per layer run.
 struct paths_component {
     std::vector<ofPath>  paths;       ///< One ofPath per stroke; use getOutline() for polyline access
@@ -151,13 +152,13 @@ struct toolpath_stats_component {
     float estimatedTime = 0.0f;
 };
 
-/// Per-layer PFM selection and all algorithm settings.
-/// The active PFM type determines which settings sub-struct is used at
-/// generation time; the others are preserved so users can switch PFMs without
+/// Per-layer plot finder selection and all algorithm settings.
+/// The active finder type determines which settings sub-struct is used at
+/// generation time; the others are preserved so users can switch finders without
 /// losing their tuning.
 struct settings_component {
-    int     brushIndex = 0;
-    PFMType pfmType    = PFMType::SketchLines;
+    int             brushIndex      = 0;
+    PlotFinderType  plotFinderType  = PlotFinderType::SketchLines;
 
     SketchLinesSettings sketchLines;
     CrossHatchSettings  crossHatch;
@@ -169,7 +170,7 @@ struct settings_component {
 /// Per-layer SVG fill rasterization cache.
 /// When `enabled`, the closed outline paths on this layer are rendered into a
 /// greyscale bitmap (using each path's colour luminance) before generation.
-/// The PFM then uses that bitmap as its source, simulating fill weight with
+/// The plot finder then uses that bitmap as its source, simulating fill weight with
 /// pen strokes instead of flat colour.  Must be populated on the main/GL
 /// thread via ImageToPath::rasterizeLayerFills() before the generate thread
 /// is spawned.

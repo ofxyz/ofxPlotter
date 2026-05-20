@@ -3,14 +3,14 @@
 //  ImageToPath.h
 //  Image-to-toolpath engine for pen plotters.
 //  Converts a raster image into vector paths (polylines) using
-//  various Path Finding Modules (PFMs) inspired by DrawingBotV3.
+//  plot finders (image-to-stroke algorithms).
 //  Supports multi-layer output with per-layer brush/colour.
 //
 //  Layers are stored as ECS entities in an internal entt::registry.
 //  Each layer entity carries:
 //    ecs::layer_component          — name, visible, locked, colour, sort index
 //    ecs::Relationship             — parent / child hierarchy
-//    plotter::settings_component   — PFM type + all algorithm settings
+//    plotter::settings_component   — plot finder type + algorithm settings
 //    plotter::paths_component      — generated ofPath strokes
 //    plotter::toolpath_stats_component — cached stats (paths, points, distance, time)
 //
@@ -29,11 +29,14 @@
 #include <functional>
 #include <algorithm>
 
+namespace plotfind { class FinderContext; }
+
 // =============================================================
 // ImageToPath - Main engine
 // =============================================================
 
 class ImageToPath {
+    friend class plotfind::FinderContext;
 public:
     ImageToPath();
 
@@ -92,6 +95,17 @@ public:
     const std::vector<entt::entity>& getFlatPathEntities() const { return m_flatPathLayerEntity; }
     const std::vector<ofColor>&      getFlatPathColors()   const { return m_flatPathColors; }
     void rebuildFlatPaths();
+    /// Recompute aggregate totalPaths / totalDistance / estimatedTime from layers + flat paths.
+    void refreshStats() { computeStats(); }
+
+    /// True if the entity and all ancestors are visible (for export / stroke bridge).
+    bool isEffectivelyVisible(entt::entity e) const;
+
+    /// Replace flat path cache (e.g. after plot processor pipeline).
+    void setFlatPaths(std::vector<ofPolyline> paths,
+                      std::vector<entt::entity> layerEntities,
+                      std::vector<ofColor> colors,
+                      bool recomputeStats = true);
 
     glm::vec2 getPaperSizeMM() const;
     ofColor   getPathColor(int flatIdx) const;
@@ -196,9 +210,6 @@ private:
     /// Rebuild layerOrder from a depth-first walk of the Relationship tree.
     void rebuildLayerOrder();
 
-    /// True if the entity AND all its ancestors are visible.
-    bool isEffectivelyVisible(entt::entity e) const;
-
     /// Append `child` as the last item in `parent`'s child list (or the root
     /// sibling chain when parent == entt::null). Assumes `child` already has an
     /// ecs::Relationship component and is fully unlinked.
@@ -216,11 +227,6 @@ private:
     void preprocessImage();
     void runLayerGeneration(entt::entity layerEntity,
         std::function<void(float, const std::string&)> onProgress);
-    void runSketchLines(std::function<void(float, const std::string&)> onProgress);
-    void runCrossHatch(std::function<void(float, const std::string&)> onProgress);
-    void runSpiral(std::function<void(float, const std::string&)> onProgress);
-    void runStippling(std::function<void(float, const std::string&)> onProgress);
-    void runContours(std::function<void(float, const std::string&)> onProgress);
     void computeStats();
 
     glm::vec2 pixelToMM(float px, float py) const;
@@ -233,13 +239,13 @@ private:
 
     ofImage  m_svgPreview;   ///< colour preview rendered from fitted SVG paths
 
-    // Scratch buffer used by PFM methods during generation
+    // Scratch buffer used by plot finders during generation
     std::vector<ofPolyline> m_paths;
 
     // Flat path list across all visible layers (for preview + full G-code export)
     std::vector<ofPolyline>   m_flatPaths;
     std::vector<entt::entity> m_flatPathLayerEntity;  ///< parallel to m_flatPaths
-    std::vector<ofColor>      m_flatPathColors;        ///< per-flat-path colour; SVG import sets individual colours, PFM falls back to layer colour
+    std::vector<ofColor>      m_flatPathColors;        ///< per-flat-path colour; SVG import sets individual colours, finders fall back to layer colour
 
     // Working image dimensions mapped to drawing area
     float m_drawWidth   = 0;
@@ -250,6 +256,6 @@ private:
     int m_workH = 0;
 
     // Entity currently being generated (set temporarily during runLayerGeneration
-    // so PFM methods can read from registry.get<settings_component>(m_genEntity))
+    // so finders can read from registry.get<settings_component>(m_genEntity))
     entt::entity m_genEntity = entt::null;
 };

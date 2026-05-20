@@ -13,4 +13,9 @@
 
 #include "PenSettings.h"
 #include "ImageToPath.h"
+#include "PlotterBedCoords.h"
 #include "PlotterExporter.h"
+#include "PlotterStrokeBridge.h"
+#include <ofxPlotFinders/src/ofxPlotFinders.h>
+#include "PlotterZones.h"
+#include "PlotterGCodeInjector.h"

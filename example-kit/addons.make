@@ -3,6 +3,8 @@ ofxImGuiVectorEditor
 ofxImGuiTextEdit
 ofxImGuizmo
 ofxPlotter
+ofxPlotProcessors
+ofxPlotFinders
 ofxGrbl
 ofxGrblKit
 ofxAssimpModelLoader

@@ -1,4 +1,6 @@
 #include "ofApp.h"
+#include "PlotPreviewDraw.h"
+#include "PlotterGcodeSync.h"
 #include "imgui.h"
 #include "RulerUtil.h"
 #include <algorithm>
@@ -7,16 +9,80 @@ namespace {
 /// ImGui::Begin titles must include ###id matching registerWindow(..., id) for docking.
 constexpr const char* kPlotterWinIdSerial   = "plotter_kit.serial";
 constexpr const char* kPlotterWinIdSettings = "plotter_kit.settings";
-constexpr const char* kPlotterWinIdPreview  = "plotter_kit.preview";
 constexpr const char* kPlotterWinIdLayers   = "plotter_kit.layers";
+constexpr const char* kPlotterWinIdGcodeGen = "plotter_kit.gcode_gen";
+constexpr const char* kPlotterWinIdJog       = "plotter_kit.jog";
+constexpr const char* kPlotterWinIdTransport = "plotter_kit.transport";
 
 constexpr const char* kImGuiTitleSerial   = "Serial / Machine###plotter_kit.serial";
 constexpr const char* kImGuiTitleSettings = "Source / Generation###plotter_kit.settings";
-constexpr const char* kImGuiTitlePreview  = "Preview###plotter_kit.preview";
+constexpr const char* kImGuiTitlePreview  = "Plot Preview###plotter_kit.preview";
 constexpr const char* kImGuiTitleLayers   = "Layers###plotter_kit.layers";
+constexpr const char* kImGuiTitleGcodeGen = "G-code Generator###plotter_kit.gcode_gen";
 
 
 } // namespace
+
+glm::vec2 ofApp::contentToPaperMM(glm::vec2 contentPt, glm::vec2 paperMM,
+                                  glm::vec2 paperOrg) const
+{
+    float px = contentPt.x - paperOrg.x;
+    float py = contentPt.y - paperOrg.y;
+    if (m_yAxisUp) py = paperMM.y - py;
+    return {px, py};
+}
+
+glm::vec2 ofApp::paperToContentMM(glm::vec2 paperPt, glm::vec2 paperMM,
+                                  glm::vec2 paperOrg) const
+{
+    float py = paperPt.y;
+    if (m_yAxisUp) py = paperMM.y - py;
+    return {paperOrg.x + paperPt.x, paperOrg.y + py};
+}
+
+plotter::ExportOptions ofApp::exportOptions()
+{
+    plotter::ExportOptions opts;
+    opts.prefs = &m_prefs;
+    opts.zones = &m_zones;
+    opts.pipeline = &m_plotPipeline;
+    opts.runPipeline = m_gcodeGen.runPipelineOnExport();
+    opts.writeBackToPaths = m_gcodeGen.writeBackToPathsOnExport();
+    return opts;
+}
+
+void ofApp::syncPlaybackToEditor()
+{
+    const int lineCount = ofkitty::runtime().codeEditorGetLineCount();
+    const int line      = plotterGcodeSync::playbackToLine(m_playbackPos, lineCount);
+    ofkitty::runtime().codeEditorSetHighlightLine(line);
+}
+
+void ofApp::setupEditorPlaybackSync()
+{
+    ofkitty::runtime().codeEditorSetSyncPlaybackFromCursor(true);
+    ofkitty::runtime().codeEditorSetOnCursorLineChanged([this](int line) {
+        if (m_syncingPlayback) return;
+        const int lineCount = ofkitty::runtime().codeEditorGetLineCount();
+        m_syncingPlayback   = true;
+        m_playbackPos       = plotterGcodeSync::lineToPlayback(line, lineCount);
+        m_lastSyncedPlayback = m_playbackPos;
+        m_syncingPlayback   = false;
+    });
+}
+
+void ofApp::updateCodeEditorSidebar()
+{
+    std::vector<ofkitty::CodeEditorPanel::SidebarEntry> entries;
+    for (const auto& r : m_resources.resources()) {
+        if (r.type != ofkitty::ResourceType::GCodeSnippet) continue;
+        ofkitty::CodeEditorPanel::SidebarEntry item;
+        item.label = r.name;
+        item.path  = r.path;
+        entries.push_back(std::move(item));
+    }
+    ofkitty::runtime().codeEditorSetSidebarEntries(std::move(entries));
+}
 
 // ============================================================================
 void ofApp::onPlotterSourceChanged()
@@ -53,6 +119,7 @@ void ofApp::setup()
     // The plotter uses Code Editor (G-code) and Preferences (ruler/UI settings).
     ofkitty::runtime().enableBuiltInWindow("Code Editor");
     ofkitty::runtime().enableBuiltInWindow("Preferences");
+    ofkitty::runtime().enableBuiltInWindow("Properties");
 
     // All content renders inside ImGui panels — no raw OpenGL scene needs to
     // bleed through the central dockspace gap, so use an opaque central node.
@@ -63,6 +130,33 @@ void ofApp::setup()
     ofDisableArbTex();
 
     m_prefs.load();
+    m_zones.load();
+    m_gcodeGen.setEngine(&m_engine);
+    m_gcodeGen.setZoneStore(&m_zones);
+    m_gcodeGen.setPipeline(&m_plotPipeline);
+    {
+        const std::string presetPath = ofToDataPath("plot_pipeline_default.json", true);
+        if (ofFile::doesFileExist(presetPath))
+            m_plotPipeline = plotproc::PlotPipeline::loadPreset(presetPath);
+        else
+            m_plotPipeline = plotproc::PlotPipeline::defaults();
+    }
+    m_gcodeGen.setSnippetPaths([this] {
+        std::vector<std::string> paths;
+        for (const auto& r : m_resources.resources()) {
+            if (r.type == ofkitty::ResourceType::GCodeSnippet)
+                paths.push_back(r.path);
+        }
+        return paths;
+    });
+    m_gcodeGen.setOnRegenerateGcode([this] { m_needsGcodeUpdate = true; });
+
+    m_jogWin.setEngine(&m_engine);
+    m_jogWin.setSender(&m_sender);
+    m_jogWin.setPrefs(&m_prefs);
+    m_jogWin.setImguiWindowTitle("Jog Control###plotter_kit.jog");
+    m_jogWin.resetMachineCoordinates();
+
     m_serialWin.setSender(&m_sender);
     m_serialWin.setPrefs(&m_prefs);
     m_serialWin.refreshDeviceList();
@@ -102,6 +196,13 @@ void ofApp::setup()
     m_layersPanel.setOnLayerChanged([this] {
         m_engine.rebuildFlatPaths();
         onPlotterSourceChanged();
+        if (m_engine.activeLayer != entt::null) {
+            m_selectedZoneIdx = -1;
+            m_gcodeGen.setSelectedZoneIndex(-1);
+            m_selPathEntity = entt::null;
+            m_selPathIdx    = -1;
+            ofkitty::runtime().select(m_engine.activeLayer);
+        }
     });
     m_layersPanel.setGetBadge([this](entt::entity e) -> std::string {
         if (!m_engine.registry.valid(e)) return "";
@@ -149,8 +250,9 @@ void ofApp::setup()
                 onPlotterSourceChanged();
             }
         } else if (r.type == ofkitty::ResourceType::GCodeSnippet) {
-            ofkitty::runtime().codeEditorSetText(r.text);
+            ofkitty::runtime().codeEditorSetText(r.text, TextEditor::LanguageDefinitionId::Gcode);
             ofkitty::runtime().setWindowVisible("Code Editor", true);
+            updateCodeEditorSidebar();
         }
     });
 
@@ -160,7 +262,14 @@ void ofApp::setup()
     ofkitty::runtime().addDefaultLayoutLeftDock(kImGuiTitleSettings);
     ofkitty::runtime().addDefaultLayoutLeftDock(kImGuiTitleLayers);
     ofkitty::runtime().addDefaultLayoutLeftDock("Resources###plotter.resources");
+    ofkitty::runtime().addDefaultLayoutLeftDock(kImGuiTitleGcodeGen);
+    ofkitty::runtime().addDefaultLayoutLeftDock("Jog Control###plotter_kit.jog");
     ofkitty::runtime().addDefaultLayoutCenterDock(kImGuiTitlePreview);
+    ofkitty::runtime().addDefaultLayoutCenterDock("Plot Transport###plotter_kit.transport");
+    ofkitty::runtime().addDefaultLayoutRightDock("Properties###ofxkit.window.properties");
+    ofkitty::runtime().addDefaultLayoutRightDock("Code Editor###ofxkit.window.code_editor");
+    updateCodeEditorSidebar();
+    setupEditorPlaybackSync();
 
     // Start in Edit mode so panels are immediately visible on first launch.
     ofkitty::runtime().setEditMode(true);
@@ -170,6 +279,16 @@ void ofApp::setup()
 void ofApp::update()
 {
     m_sender.update();
+    m_jogWin.update();
+
+    if (m_jogWin.isMachinePositionLive()) {
+        const glm::vec3 mp = m_jogWin.getMachinePosition();
+        m_livePenX     = mp.x;
+        m_livePenY     = mp.y;
+        m_livePenValid = true;
+    } else {
+        m_livePenValid = false;
+    }
 
     if (m_needsTextureUpload && !m_generating) {
         m_needsTextureUpload = false;
@@ -219,11 +338,28 @@ void ofApp::update()
     // After generation completes, build G-code and push it into the Code Editor.
     if (m_needsGcodeUpdate && !m_generating) {
         m_needsGcodeUpdate = false;
-        std::string gcode = plotter::toGCode(m_engine);
-        ofkitty::runtime().codeEditorSetText(gcode);
+        m_playbackPos = 1.f;
+        auto opts = exportOptions();
+        std::string gcode = plotter::toGCode(m_engine, opts);
+        if (opts.hasPipelineReport)
+            m_gcodeGen.setLastPipelineReport(opts.lastPipelineReport, true);
+        ofkitty::runtime().codeEditorSetText(gcode, TextEditor::LanguageDefinitionId::Gcode);
         ofkitty::runtime().setWindowVisible("Code Editor", true);
+        updateCodeEditorSidebar();
+        m_lastSyncedPlayback = m_playbackPos;
+        syncPlaybackToEditor();
     }
 
+    // Highlight the G-code line currently being sent while the queue is active.
+    const bool printing = m_sender.pendingLines() > 0 || m_sender.isWaitingAck();
+    const int  curLine  = m_sender.currentEditorLine();
+    if (printing && curLine >= 0) {
+        ofkitty::runtime().codeEditorSetHighlightLine(curLine);
+        m_lastPrintEditorLine = curLine;
+    } else if (m_lastPrintEditorLine >= 0) {
+        m_lastPrintEditorLine = -1;
+        syncPlaybackToEditor();
+    }
 }
 
 // ============================================================================
@@ -236,6 +372,7 @@ void ofApp::exit()
 {
     if (m_generateThread.joinable()) m_generateThread.join();
     m_prefs.save();
+    m_zones.save();
 }
 
 // ============================================================================
@@ -255,11 +392,18 @@ void ofApp::setupUI()
         kPlotterWinIdSettings,
     });
 
-    ofkitty::runtime().registerWindow({
-        "Preview", "View", true, true,
-        [this](bool& visible) { drawPreviewPanel(visible); },
-        kPlotterWinIdPreview,
-    });
+    // Ortho2D viewport — content size is machine envelope (updated in headerDraw).
+    m_previewVP = ofkitty::runtime().addViewportWindow2D(
+        kImGuiTitlePreview, bedView().contentSize(), "mm", /*editModeOnly=*/false);
+    m_previewVP->showRulers = m_showPreviewRulers;
+    m_previewVP->guides     = &m_guides;
+
+    m_previewVP->menuBarDraw = [this] { drawPreviewMenuBar(); };
+    m_previewVP->headerDraw  = [this]() -> bool { return drawPreviewHeader(); };
+    m_previewVP->renderer2D  = [this] { drawPreviewContent(); };
+    m_previewVP->overlayDraw = [this](ofkitty::Runtime::ViewportInstance& vp) {
+        drawPreviewOverlays(vp);
+    };
 
     ofkitty::runtime().registerWindow({
         "Layers", "View", true, true,
@@ -269,8 +413,59 @@ void ofApp::setupUI()
 
     ofkitty::runtime().registerWindow({
         "Resources", "View", true, true,
-        [this](bool& visible) { m_resources.draw("Resources###plotter.resources", visible); },
+        [this](bool& visible) {
+            m_resources.draw("Resources###plotter.resources", visible);
+            updateCodeEditorSidebar();
+        },
     });
+
+    ofkitty::runtime().registerWindow({
+        "G-code Generator", "View", true, true,
+        [this](bool& visible) { m_gcodeGen.draw(kImGuiTitleGcodeGen, visible); },
+        kPlotterWinIdGcodeGen,
+    });
+
+    ofkitty::runtime().registerWindow({
+        "Jog Control", "View", true, false,
+        [this](bool& visible) { m_jogWin.draw(visible); },
+        kPlotterWinIdJog,
+    });
+
+    ofkitty::runtime().registerWindow({
+        "Plot Transport", "View", true, false,
+        [this](bool& visible) { drawPlotTransport(visible); },
+        kPlotterWinIdTransport,
+    });
+
+    ofkitty::runtime().registerStatusItem({
+        "plotter_kit.status.machine",
+        "Plotter",
+        true,
+        [this] {
+            const bool sim = m_sender.isSimulationMode();
+            const bool connected = m_sender.isConnected();
+            if (connected) {
+                const ImVec4 col = sim ? ImVec4(0.95f, 0.75f, 0.25f, 1.f)
+                                       : ImVec4(0.39f, 0.90f, 0.50f, 1.f);
+                ImGui::TextColored(col, sim ? "Simulation" : "Connected");
+            } else {
+                ImGui::TextColored(ImVec4(0.9f, 0.35f, 0.35f, 1.f), "Disconnected");
+            }
+            if (m_livePenValid) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("X%.1f Y%.1f", m_livePenX, m_livePenY);
+            }
+        },
+    });
+
+    ofkitty::runtime().registerStatusItem({
+        "plotter_kit.status.jog",
+        "Plotter",
+        true,
+        [this] { m_jogWin.drawStatusBar(); },
+    });
+
+    ofkitty::runtime().setPropertiesSupplement([this] { drawPlotterPropertiesSupplement(); });
 
     ofkitty::runtime().addMenuBarGroup("Plotter", [this] {
         bool ready = m_sender.isConnected() && !m_generating
@@ -290,7 +485,10 @@ void ofApp::setupUI()
         if (ImGui::MenuItem("Show all panels")) {
             ofkitty::runtime().setWindowVisible(m_serialWin.name(),      true);
             ofkitty::runtime().setWindowVisible("Source / Generation",   true);
-            ofkitty::runtime().setWindowVisible("Preview",               true);
+            ofkitty::runtime().setWindowVisible("Plot Preview",          true);
+            ofkitty::runtime().setWindowVisible("Jog Control",           true);
+            ofkitty::runtime().setWindowVisible("Plot Transport",      true);
+            ofkitty::runtime().setWindowVisible("Properties",          true);
             ofkitty::runtime().setWindowVisible("Layers",                true);
         }
     });
@@ -453,24 +651,24 @@ void ofApp::drawSettingsPanel(bool& visible)
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(
                     "Rasterise this layer's closed filled shapes and run the\n"
-                    "PFM below to simulate their fill weight with pen strokes.\n"
-                    "Each layer can use a different PFM and settings.");
+                    "plot finder below to simulate their fill weight with pen strokes.\n"
+                    "Each layer can use a different finder and settings.");
             if (frc->enabled) ImGui::Spacing();
         }
 
         auto& settings = m_engine.getActiveSettings();
         {
-            static const char* kPFMs[] = {
+            static const char* kPlotFinders[] = {
                 "Sketch Lines", "Cross-Hatch", "Spiral", "Stippling", "Contours"
             };
-            int idx = (int)settings.pfmType;
-            if (ImGui::Combo("PFM", &idx, kPFMs, IM_ARRAYSIZE(kPFMs)))
-                settings.pfmType = (PFMType)idx;
+            int idx = (int)settings.plotFinderType;
+            if (ImGui::Combo("Plot finder", &idx, kPlotFinders, IM_ARRAYSIZE(kPlotFinders)))
+                settings.plotFinderType = (PlotFinderType)idx;
         }
 
         ImGui::Indent();
-        switch (settings.pfmType) {
-            case PFMType::SketchLines: {
+        switch (settings.plotFinderType) {
+            case PlotFinderType::SketchLines: {
                 auto& s = settings.sketchLines;
                 ImGui::DragFloat("Min length",  &s.lineMinLength,  0.5f,  0.f, 200.f, "%.1f mm");
                 ImGui::DragFloat("Max length",  &s.lineMaxLength,  0.5f,  0.f, 200.f, "%.1f mm");
@@ -479,7 +677,7 @@ void ofApp::drawSettingsPanel(bool& visible)
                 ImGui::Checkbox ("Lift pen",    &s.shouldLiftPen);
                 break;
             }
-            case PFMType::CrossHatch: {
+            case PlotFinderType::CrossHatch: {
                 auto& s = settings.crossHatch;
                 ImGui::DragFloat("Angle 1",        &s.angle1,        1.f, 0.f,  180.f, "%.0f°");
                 ImGui::DragFloat("Angle 2",        &s.angle2,        1.f, 0.f,  180.f, "%.0f°");
@@ -488,7 +686,7 @@ void ofApp::drawSettingsPanel(bool& visible)
                 ImGui::DragFloat("Min brightness", &s.minBrightness, 0.01f, 0.f, 1.f);
                 break;
             }
-            case PFMType::Spiral: {
+            case PlotFinderType::Spiral: {
                 auto& s = settings.spiral;
                 ImGui::DragFloat("Ring spacing", &s.ringSpacing, 0.1f, 0.1f, 20.f, "%.1f mm");
                 ImGui::DragFloat("Amplitude",    &s.amplitude,   0.1f, 0.f,  10.f);
@@ -496,7 +694,7 @@ void ofApp::drawSettingsPanel(bool& visible)
                 ImGui::Checkbox ("Ignore white", &s.ignoreWhite);
                 break;
             }
-            case PFMType::Stippling: {
+            case PlotFinderType::Stippling: {
                 auto& s = settings.stippling;
                 ImGui::DragFloat("Spacing min", &s.dotSpacingMin, 0.05f, 0.1f, 20.f, "%.2f mm");
                 ImGui::DragFloat("Spacing max", &s.dotSpacingMax, 0.05f, 0.1f, 20.f, "%.2f mm");
@@ -504,7 +702,7 @@ void ofApp::drawSettingsPanel(bool& visible)
                 ImGui::DragInt  ("Iterations",  &s.iterations,    1,     1,   500);
                 break;
             }
-            case PFMType::Contours: {
+            case PlotFinderType::Contours: {
                 auto& s = settings.contours;
                 ImGui::DragFloat("Canny low",   &s.cannyLow,       1.f, 0.f, 255.f);
                 ImGui::DragFloat("Canny high",  &s.cannyHigh,      1.f, 0.f, 255.f);
@@ -538,8 +736,11 @@ void ofApp::drawSettingsPanel(bool& visible)
             if (!canGenerate && !hasSvgPaths) ImGui::BeginDisabled();
             if (ImGui::Button("Generate##run", ImVec2(-1.f, 0.f))) {
                 if (hasSvgPaths) {
-                    std::string gcode = plotter::toGCode(m_engine);
-                    ofkitty::runtime().codeEditorSetText(gcode);
+                    auto opts = exportOptions();
+        std::string gcode = plotter::toGCode(m_engine, opts);
+        if (opts.hasPipelineReport)
+            m_gcodeGen.setLastPipelineReport(opts.lastPipelineReport, true);
+                    ofkitty::runtime().codeEditorSetText(gcode, TextEditor::LanguageDefinitionId::Gcode);
                     ofkitty::runtime().setWindowVisible("Code Editor", true);
                 } else {
                     startGenerate();
@@ -569,202 +770,208 @@ void ofApp::drawSettingsPanel(bool& visible)
 }
 
 // ============================================================================
-void ofApp::drawPreviewPanel(bool& visible)
-{
-    constexpr ImGuiWindowFlags kWinFlags = ImGuiWindowFlags_MenuBar;
-    if (!ImGui::Begin(kImGuiTitlePreview, &visible, kWinFlags)) {
-        ImGui::End();
-        return;
-    }
+// Preview — four focused callbacks wired to the Ortho2D viewport (m_previewVP)
+// ============================================================================
 
-    if (ImGui::BeginMenuBar()) {
-        if (ImGui::BeginMenu("Preview")) {
-            if (m_engine.hasSvgPreview()) {
-                ImGui::MenuItem("Show SVG", nullptr, &m_showSvgOverlay);
-                if (m_showSvgOverlay) {
-                    ImGui::SetNextItemWidth(120.f);
-                    ImGui::SliderFloat("Dim##svg", &m_svgOverlayAlpha, 0.f, 1.f, "%.2f");
-                }
-                ImGui::Separator();
-            }
-            ImGui::MenuItem("Show Image", nullptr, &m_showImageOverlay);
-            if (m_showImageOverlay) {
+void ofApp::drawPreviewMenuBar()
+{
+    if (!m_previewVP) return;
+    if (ImGui::BeginMenu("Plot Preview")) {
+        if (m_engine.hasSvgPreview()) {
+            ImGui::MenuItem("Show SVG", nullptr, &m_showSvgOverlay);
+            if (m_showSvgOverlay) {
                 ImGui::SetNextItemWidth(120.f);
-                ImGui::SliderFloat("Dim##img", &m_imageOverlayAlpha, 0.f, 1.f, "%.2f");
-                ImGui::MenuItem("Lock Image", nullptr, &m_imageOverlayLocked);
+                ImGui::SliderFloat("Dim##svg", &m_svgOverlayAlpha, 0.f, 1.f, "%.2f");
             }
             ImGui::Separator();
-            ImGui::MenuItem("Rulers", nullptr, &m_showPreviewRulers);
-            ImGui::Separator();
-            ImGui::MenuItem("Guides", nullptr, &m_guides.visible);
-            if (ImGui::MenuItem("Clear Guides")) { m_guides.h.clear(); m_guides.v.clear(); }
-            ImGui::Separator();
-            {
-                bool showMargin = ofkitty::runtime().showMarginRect();
-                if (ImGui::MenuItem("Margin", nullptr, &showMargin))
-                    ofkitty::runtime().setShowMarginRect(showMargin);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Toggle the printable-area outline (purple by default).\n"
-                                      "Colour lives in Preferences > Margin overlay.");
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Fit to window")) { m_previewZoom = 1.f; m_previewPan = {0.f, 0.f}; }
+        }
+        ImGui::MenuItem("Show Image", nullptr, &m_showImageOverlay);
+        if (m_showImageOverlay) {
+            ImGui::SetNextItemWidth(120.f);
+            ImGui::SliderFloat("Dim##img", &m_imageOverlayAlpha, 0.f, 1.f, "%.2f");
+            ImGui::MenuItem("Lock Image", nullptr, &m_imageOverlayLocked);
+        }
+        ImGui::Separator();
+        ImGui::MenuItem("Rulers", nullptr, &m_previewVP->showRulers);
+        ImGui::Separator();
+        ImGui::MenuItem("Guides", nullptr, &m_guides.visible);
+        if (ImGui::MenuItem("Clear Guides")) { m_guides.h.clear(); m_guides.v.clear(); }
+        ImGui::Separator();
+        ImGui::MenuItem("Grid", nullptr, &m_showGrid);
+        ImGui::MenuItem("Brush preview", nullptr, &m_showBrushPreview);
+        ImGui::MenuItem("Y+ up (GRBL)", nullptr, &m_yAxisUp);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("ON: origin bottom-left like GRBL output.\nOFF: top-left like the source image.");
+        ImGui::MenuItem("Machine envelope", nullptr, &m_showMachineEnvelope);
+        ImGui::MenuItem("Zones", nullptr, &m_showZones);
+        ImGui::MenuItem("Margin", nullptr, &m_showMargin);
+        ImGui::MenuItem("Pen position", nullptr, &m_showPenPos);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Cyan = live GRBL position. Red crosshair = playback play head.");
+        if (ImGui::BeginMenu("Zone tool")) {
+            bool sel = m_zoneTool == ZoneTool::Select;
+            bool nz  = m_zoneTool == ZoneTool::NewZone;
+            bool ap  = m_zoneTool == ZoneTool::AddPosition;
+            if (ImGui::MenuItem("Select", nullptr, sel)) m_zoneTool = ZoneTool::Select;
+            if (ImGui::MenuItem("New zone (drag)", nullptr, nz)) m_zoneTool = ZoneTool::NewZone;
+            if (ImGui::MenuItem("Add position", nullptr, ap)) m_zoneTool = ZoneTool::AddPosition;
             ImGui::EndMenu();
         }
-
-        // ---- Zoom controls in menu bar ----
         ImGui::Separator();
-        if (ImGui::SmallButton(" - "))
-            m_previewZoom = std::max(0.1f, m_previewZoom / 1.25f);
-        ImGui::SameLine(0, 2);
-        char zoomLabel[16];
-        snprintf(zoomLabel, sizeof(zoomLabel), " %3.0f%% ", m_previewZoom * 100.f);
-        if (ImGui::SmallButton(zoomLabel)) { m_previewZoom = 1.f; m_previewPan = {0.f, 0.f}; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click to fit\nScroll wheel to zoom\nAlt+drag or middle-drag to pan");
-        ImGui::SameLine(0, 2);
-        if (ImGui::SmallButton(" + "))
-            m_previewZoom = std::min(50.f, m_previewZoom * 1.25f);
-
-        ImGui::EndMenuBar();
+        if (ImGui::MenuItem("Fit to window"))
+            { m_previewVP->zoom2D = 1.f; m_previewVP->pan2D = {}; }
+        ImGui::EndMenu();
     }
+    ImGui::Separator();
+    if (ImGui::SmallButton(" - "))
+        m_previewVP->zoom2D = std::max(0.1f, m_previewVP->zoom2D / 1.25f);
+    ImGui::SameLine(0, 2);
+    char zoomLabel[16];
+    snprintf(zoomLabel, sizeof(zoomLabel), " %3.0f%% ", m_previewVP->zoom2D * 100.f);
+    if (ImGui::SmallButton(zoomLabel)) { m_previewVP->zoom2D = 1.f; m_previewVP->pan2D = {}; }
+    ImGui::SameLine(0, 2);
+    if (ImGui::SmallButton(" + "))
+        m_previewVP->zoom2D = std::min(50.f, m_previewVP->zoom2D * 1.25f);
+}
 
-    if (m_generating.load()) {
-        ImGui::ProgressBar(m_progress.load(), ImVec2(-1.f, 0.f), m_progressMsg.c_str());
-        ImGui::End();
+void ofApp::drawPlaybackTransport()
+{
+    if (m_engine.getPaths().empty()) {
+        ImGui::TextDisabled("Generate paths to enable playback.");
         return;
     }
 
-    const auto& paths = m_engine.getPaths();
-    if (paths.empty() && !m_engine.hasImage()) {
-        ImGui::TextDisabled("No paths — load an image and click Generate, or import SVG.");
-        ImGui::End();
-        return;
+    const int totalPaths = (int)m_engine.getPaths().size();
+    int currentPath      = (int)(m_playbackPos * totalPaths);
+    currentPath          = std::clamp(currentPath, 0, totalPaths);
+    const int gcodeLines = ofkitty::runtime().codeEditorGetLineCount();
+    const int gcodeLine  = plotterGcodeSync::playbackToLine(m_playbackPos, gcodeLines);
+    float pct            = m_playbackPos * 100.f;
+
+    if (ImGui::Button("|<")) {
+        m_playbackPos = 0.f;
+        syncPlaybackToEditor();
+        m_lastSyncedPlayback = m_playbackPos;
     }
-
-    // -------------------------------------------------------------------------
-    // Layout: ruler strips are pinned to the window content edges; the canvas
-    // starts after them so artwork is never under a ruler strip.
-    // -------------------------------------------------------------------------
-    const auto& prefs = ofkitty::runtime().appPrefs();
-    const bool useMM  = (prefs.rulerUnit == ofkitty::Runtime::AppPrefs::RulerUnit::Millimetres);
-
-    const float RS_px = m_showPreviewRulers
-        ? std::round(20.f * ofkitty::runtime().uiScale() * prefs.rulerScale)
-        : 0.f;
-
-    // Full available content region (from ImGui cursor position, post-menubar)
-    const ImVec2 windowOrigin = ImGui::GetCursorScreenPos();   // ruler corner
-    const ImVec2 fullAvail    = ImGui::GetContentRegionAvail();
-
-    // Canvas area: to the right/below the ruler strips
-    const ImVec2 canvasOrigin(windowOrigin.x + RS_px, windowOrigin.y + RS_px);
-    const float  canvasW = fullAvail.x - RS_px;
-    const float  canvasH = fullAvail.y - RS_px;
-
-    // Place the InvisibleButton over the canvas area only, so the ruler strip
-    // area keeps its own hit zone for guide-drag creation.
-    ImGui::SetCursorScreenPos(canvasOrigin);
-    ImGui::InvisibleButton("canvas##paths", ImVec2(canvasW, canvasH));
-    const bool canvasHovered = ImGui::IsItemHovered();
-    ImGui::SetCursorScreenPos(windowOrigin);   // restore for any later ImGui calls
-
-    const ImGuiIO& io = ImGui::GetIO();
-
-    // ---- Zoom with mouse wheel (zoom around cursor) ----
-    glm::vec2 paperMM = m_engine.getPaperSizeMM();
-    const float fitZoom = std::min(canvasW / paperMM.x, canvasH / paperMM.y);
-
-    if (canvasHovered && io.MouseWheel != 0.f) {
-        const float factor  = (io.MouseWheel > 0.f) ? 1.15f : 1.f / 1.15f;
-        const float zoomOld = fitZoom * m_previewZoom;
-        // Paper left/top in canvas-local coords before zoom
-        const float pxOld = canvasW * 0.5f + m_previewPan.x - paperMM.x * zoomOld * 0.5f;
-        const float pyOld = canvasH * 0.5f + m_previewPan.y - paperMM.y * zoomOld * 0.5f;
-        // Mouse position in paper units
-        const float mu = (io.MousePos.x - canvasOrigin.x - pxOld) / zoomOld;
-        const float mv = (io.MousePos.y - canvasOrigin.y - pyOld) / zoomOld;
-        m_previewZoom  *= factor;
-        const float zoomNew = fitZoom * m_previewZoom;
-        // Adjust pan so the paper point under the cursor stays fixed
-        m_previewPan.x = io.MousePos.x - canvasOrigin.x - mu * zoomNew - canvasW * 0.5f + paperMM.x * zoomNew * 0.5f;
-        m_previewPan.y = io.MousePos.y - canvasOrigin.y - mv * zoomNew - canvasH * 0.5f + paperMM.y * zoomNew * 0.5f;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start");
+    ImGui::SameLine();
+    if (ImGui::Button("<")) {
+        m_playbackPos = std::max(0.f, m_playbackPos - 1.f / std::max(1, totalPaths));
+        syncPlaybackToEditor();
+        m_lastSyncedPlayback = m_playbackPos;
     }
-
-    // ---- Pan with middle-mouse drag or Alt+LMB drag ----
-    if (canvasHovered && (io.MouseDown[2] || (io.MouseDown[0] && io.KeyAlt))) {
-        m_previewPan.x += io.MouseDelta.x;
-        m_previewPan.y += io.MouseDelta.y;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous path");
+    ImGui::SameLine();
+    if (ImGui::Button(">")) {
+        m_playbackPos = std::min(1.f, m_playbackPos + 1.f / std::max(1, totalPaths));
+        syncPlaybackToEditor();
+        m_lastSyncedPlayback = m_playbackPos;
     }
-
-    // ---- Double-click to fit ----
-    if (canvasHovered && io.MouseDoubleClicked[0] && !io.KeyAlt) {
-        m_previewZoom = 1.f;
-        m_previewPan  = {0.f, 0.f};
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next path");
+    ImGui::SameLine();
+    if (ImGui::Button(">|")) {
+        m_playbackPos = 1.f;
+        syncPlaybackToEditor();
+        m_lastSyncedPlayback = m_playbackPos;
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("End");
 
-    // ---- Compute paper screen position ----
-    const float zoom = fitZoom * m_previewZoom;
-    // ox, oy = screen-space position of the paper's top-left corner.
-    // Coordinate system (Y-DOWN, matching OF screen and ImGui screen):
-    //   screen = (ox + mm.x * zoom,  oy + mm.y * zoom)
-    //   mm     = ((screen.x - ox) / zoom,  (screen.y - oy) / zoom)
-    const float ox = canvasOrigin.x + canvasW * 0.5f + m_previewPan.x - paperMM.x * zoom * 0.5f;
-    const float oy = canvasOrigin.y + canvasH * 0.5f + m_previewPan.y - paperMM.y * zoom * 0.5f;
-
-    // Canonical coordinate converters — use these for ALL hit-testing and positioning.
-    auto toScreen = [&](float mmx, float mmy) -> ImVec2 {
-        return { ox + mmx * zoom, oy + mmy * zoom };
-    };
-    auto toMm = [&](float sx, float sy) -> glm::vec2 {
-        return { (sx - ox) / zoom, (sy - oy) / zoom };
-    };
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    // Clip all drawing to the canvas area so nothing bleeds under the ruler strips
-    dl->PushClipRect(canvasOrigin,
-                     ImVec2(canvasOrigin.x + canvasW, canvasOrigin.y + canvasH), true);
-
-    // ---- Allocate / resize the OF-backed preview FBO ----
-    {
-        bool needsAlloc = !m_previewFbo.isAllocated()
-            || std::fabs(m_previewFboSize.x - canvasW) > 0.5f
-            || std::fabs(m_previewFboSize.y - canvasH) > 0.5f;
-        if (needsAlloc) {
-            ofDisableArbTex();
-            ofFboSettings s;
-            s.width          = std::max(1, (int)canvasW);
-            s.height         = std::max(1, (int)canvasH);
-            s.internalformat = GL_RGBA;
-            s.useDepth       = false;
-            m_previewFbo.allocate(s);
-            ofEnableArbTex();
-            m_previewFboSize = { canvasW, canvasH };
+    ImGui::SameLine();
+    ImGui::PushItemWidth(-1.f);
+    char label[192];
+    snprintf(label, sizeof(label),
+             "Play head %.1f%%  |  G-code line %d/%d  |  Path %d/%d  |  red tip in preview",
+             pct, gcodeLine + 1, gcodeLines, currentPath, totalPaths);
+    if (ImGui::SliderFloat("##playback", &pct, 0.f, 100.f, label)) {
+        m_playbackPos = pct / 100.f;
+        if (!m_syncingPlayback && m_playbackPos != m_lastSyncedPlayback) {
+            m_lastSyncedPlayback = m_playbackPos;
+            syncPlaybackToEditor();
         }
     }
+    ImGui::PopItemWidth();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Scrub the plot play head. Syncs to the Code Editor current line.\n"
+            "Cyan crosshair = live machine position when connected.");
+}
 
-    // ---- Render scene into FBO ----
-    // Paper origin in FBO pixel space (FBO covers canvasOrigin..canvasOrigin+canvasW/H)
-    const float fboOx = ox - canvasOrigin.x;
-    const float fboOy = oy - canvasOrigin.y;
+bool ofApp::drawPreviewHeader()
+{
+    if (m_generating.load()) {
+        ImGui::ProgressBar(m_progress.load(), ImVec2(-1.f, 0.f), m_progressMsg.c_str());
+        return true;
+    }
+    if (m_engine.getPaths().empty() && !m_engine.hasImage()) {
+        ImGui::TextDisabled("No paths — load an image and click Generate, or import SVG.");
+        return true;
+    }
+    if (m_previewVP)
+        m_previewVP->contentSize = bedView().contentSize();
 
-    m_previewFbo.begin();
-    ofClear(0, 0, 0, 0);
-    // ofSetupScreenOrtho sets Y-UP (glm::ortho with bottom=0, top=h).
-    // We immediately flip to Y-DOWN so that (0,0) is the top-left, matching
-    // the screen-space margin overlay and making pan behave intuitively.
-    ofSetupScreenOrtho(canvasW, canvasH, -1.f, 1.f);
-    ofTranslate(0.f, canvasH, 0.f);
-    ofScale(1.f, -1.f, 1.f);
+    if (!m_engine.getPaths().empty())
+        drawPlaybackTransport();
 
-    // Paper / canvas background
-    {
-        const ofColor& c = m_engine.canvasColor;
-        ofSetColor(c);
-        ofDrawRectangle(fboOx, fboOy, paperMM.x * zoom, paperMM.y * zoom);
+    return false;
+}
+
+void ofApp::drawPlotTransport(bool& visible)
+{
+    ImGui::SetNextWindowSize(ImVec2(640, 72), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Plot Transport###plotter_kit.transport", &visible)) {
+        ImGui::End();
+        return;
+    }
+    drawPlaybackTransport();
+    ImGui::End();
+}
+
+void ofApp::drawPlotterPropertiesSupplement()
+{
+    if (m_selectedZoneIdx >= 0 && m_selectedZoneIdx < (int)m_zones.zones.size()) {
+        ImGui::TextUnformatted("Maintenance zone");
+        m_gcodeGen.setSelectedZoneIndex(m_selectedZoneIdx);
+        m_gcodeGen.drawZoneInspector();
+        return;
     }
 
-    // SVG colour preview overlay (drawn before paths and image so it sits at the bottom)
+    if (ofkitty::runtime().selected() != entt::null) {
+        ImGui::TextDisabled("Layer / path — ECS components below.");
+        return;
+    }
+
+    ImGui::TextUnformatted("Pen / machine");
+    ImGui::DragFloat("Pen down Z", &m_engine.pen.penDownZ, 0.1f, -20.f, 20.f, "%.1f mm");
+    ImGui::DragFloat("Pen up Z", &m_engine.pen.penUpZ, 0.1f, 0.f, 40.f, "%.1f mm");
+    ImGui::DragFloat("Draw speed", &m_engine.pen.drawSpeed, 10.f, 100.f, 10000.f, "%.0f mm/min");
+    ImGui::DragFloat("Travel speed", &m_engine.pen.travelSpeed, 10.f, 100.f, 10000.f, "%.0f mm/min");
+    ImGui::Checkbox("Slow travels", &m_engine.pen.slowTravels);
+    ImGui::TextDisabled("Click a zone in Plot Preview or a path/layer to edit more.");
+}
+
+void ofApp::drawPreviewContent()
+{
+    // Content coords = machine bed relative to envelope min.
+    const plotter::BedView bed = bedView();
+    const glm::vec2 paperMM  = m_engine.getPaperSizeMM();
+    const glm::vec2 paperOrg = bed.paperOriginContent();
+
+    ofSetColor(40, 42, 48);
+    ofDrawRectangle(0, 0, bed.contentSize().x, bed.contentSize().y);
+
+    ofPushMatrix();
+    ofTranslate(paperOrg.x, paperOrg.y);
+    if (m_yAxisUp) {
+        ofTranslate(0.f, paperMM.y);
+        ofScale(1.f, -1.f);
+    }
+
+    ofSetColor(m_engine.canvasColor);
+    ofDrawRectangle(0, 0, paperMM.x, paperMM.y);
+
+    if (m_showGrid && m_previewVP)
+        plotPreview::drawPaperGrid(paperMM.x, paperMM.y, m_previewVP->contentZoom());
+
     if (m_showSvgOverlay && m_engine.hasSvgPreview()) {
         const ofTexture& svgTex = m_engine.getSvgPreview().getTexture();
         if (svgTex.isAllocated()) {
@@ -772,121 +979,282 @@ void ofApp::drawPreviewPanel(bool& visible)
             const float dw = m_engine.imageOverlayW, dh = m_engine.imageOverlayH;
             if (dw > 0.f && dh > 0.f) {
                 ofSetColor(255, 255, 255, (int)(m_svgOverlayAlpha * 255.f));
-                svgTex.draw(fboOx + dx * zoom, fboOy + dy * zoom, dw * zoom, dh * zoom);
+                svgTex.draw(dx, dy, dw, dh);
             }
         }
     }
 
-    // Image overlay (drawn before paths so it sits underneath)
     if (m_showImageOverlay) {
         const ofTexture* tex = previewRasterTextureOrNull();
         const float iox = m_engine.imageOverlayX, ioy = m_engine.imageOverlayY;
         const float iow = m_engine.imageOverlayW, ioh = m_engine.imageOverlayH;
         if (tex && tex->isAllocated() && iow > 0.f && ioh > 0.f) {
             ofSetColor(255, 255, 255, (int)(m_imageOverlayAlpha * 255.f));
-            tex->draw(fboOx + iox * zoom, fboOy + ioy * zoom, iow * zoom, ioh * zoom);
+            tex->draw(iox, ioy, iow, ioh);
         }
     }
 
-    // Paths — drawn with OF so we get smooth anti-aliased strokes
-    {
+    const auto& fpaths = m_engine.getPaths();
+    const int maxPath  = std::clamp((int)(m_playbackPos * fpaths.size()), 0, (int)fpaths.size());
+
+    if (m_showBrushPreview)
+        plotPreview::drawBrushEstimation(m_engine, maxPath);
+
+    ofSetLineWidth(1.5f);
+    for (int i = 0; i < maxPath; ++i) {
+        const ofPolyline& poly = fpaths[i];
+        if (poly.size() < 2) continue;
+        ofColor c = m_engine.getPathColor(i);
+        ofSetColor(c.r, c.g, c.b, 220);
+        poly.draw();
+    }
+
+    ofPopMatrix();
+}
+
+
+void ofApp::drawPreviewOverlays(ofkitty::Runtime::ViewportInstance& vp)
+{
+    ImDrawList*    dl      = ImGui::GetWindowDrawList();
+    const ImGuiIO& io      = ImGui::GetIO();
+    const float    zoom    = vp.contentZoom();
+    const plotter::BedView bed = bedView();
+    const glm::vec2 paperMM  = m_engine.getPaperSizeMM();
+    const glm::vec2 paperOrg = bed.paperOriginContent();
+    const auto&    fpaths  = m_engine.getPaths();
+
+    // ---- Machine envelope (full content area) ----
+    if (m_showMachineEnvelope) {
+        const glm::vec2 cs = bed.contentSize();
+        ImVec2 tl = vp.toScreen(0, 0);
+        ImVec2 br = vp.toScreen(cs.x, cs.y);
+        dl->AddRect(tl, br, IM_COL32(120, 140, 180, 200), 0.f, 0, 2.f);
+    }
+
+    // ---- Maintenance zones ----
+    if (m_showZones) {
+        for (int zi = 0; zi < (int)m_zones.zones.size(); ++zi) {
+            const auto& z = m_zones.zones[zi];
+            const glm::vec2 ztl = bed.machineToContent(z.x, z.y);
+            const glm::vec2 zbr = bed.machineToContent(z.x + z.w, z.y + z.h);
+            const bool sel = m_selectedZoneIdx == zi;
+            const ImU32 fill = sel ? IM_COL32(80, 160, 255, 40) : IM_COL32(80, 160, 255, 20);
+            const ImU32 stroke = sel ? IM_COL32(80, 200, 255, 220) : IM_COL32(80, 160, 255, 140);
+            ImVec2 sTL = vp.toScreen(ztl.x, ztl.y);
+            ImVec2 sBR = vp.toScreen(zbr.x, zbr.y);
+            dl->AddRectFilled(sTL, sBR, fill);
+            dl->AddRect(sTL, sBR, stroke, 0.f, 0, sel ? 2.f : 1.f);
+            for (const auto& p : z.positions) {
+                const glm::vec2 pc = bed.machineToContent(p.x, p.y);
+                ImVec2 sp = vp.toScreen(pc.x, pc.y);
+                dl->AddCircleFilled(sp, 5.f, IM_COL32(255, 200, 60, 255));
+                dl->AddCircle(sp, 5.f, IM_COL32(40, 40, 40, 255), 0, 1.5f);
+            }
+        }
+    }
+
+    if (!fpaths.empty())
+        m_gcodeGen.refreshInjectionMarkers();
+
+    // ---- Injection preview markers ----
+    for (const auto& mk : m_gcodeGen.injectionMarkersContent()) {
+        ImVec2 sp = vp.toScreen(mk.x, mk.y);
+        dl->AddCircleFilled(sp, 4.f, IM_COL32(255, 80, 80, 220));
+    }
+
+    // ---- Live machine pen (cyan) and playback tip (red) ----
+    if (m_showPenPos) {
+        if (m_livePenValid) {
+            const glm::vec2 lc = bed.machineToContent(m_livePenX, m_livePenY);
+            ImVec2 sp = vp.toScreen(lc.x, lc.y);
+            dl->AddCircle(sp, 6.f, IM_COL32(50, 200, 255, 220), 0, 2.f);
+            dl->AddLine(ImVec2(sp.x - 8, sp.y), ImVec2(sp.x + 8, sp.y), IM_COL32(50, 200, 255, 255), 1.5f);
+            dl->AddLine(ImVec2(sp.x, sp.y - 8), ImVec2(sp.x, sp.y + 8), IM_COL32(50, 200, 255, 255), 1.5f);
+        }
         const auto& fpaths = m_engine.getPaths();
-        ofPushMatrix();
-        ofTranslate(fboOx, fboOy);
-        ofScale(zoom, zoom);
-        ofSetLineWidth(1.5f);   // screen pixels regardless of zoom
-        for (int i = 0; i < (int)fpaths.size(); ++i) {
-            const ofPolyline& poly = fpaths[i];
-            if (poly.size() < 2) continue;
-            ofColor c = m_engine.getPathColor(i);
-            ofSetColor(c.r, c.g, c.b, 220);
-            poly.draw();
+        if (!fpaths.empty()) {
+            const int maxPath = std::clamp((int)(m_playbackPos * fpaths.size()), 1, (int)fpaths.size());
+            const auto& lastPath = fpaths[maxPath - 1];
+            if (lastPath.size() >= 1) {
+                const auto& v = lastPath.getVertices().back();
+                const glm::vec2 pc = paperToContentMM({v.x, v.y}, paperMM, paperOrg);
+                ImVec2 sp = vp.toScreen(pc.x, pc.y);
+                dl->AddCircle(sp, 5.f, IM_COL32(255, 50, 50, 200), 0, 1.5f);
+            }
         }
-        ofPopMatrix();
     }
 
-    m_previewFbo.end();
+    // ---- Zone tool: drag new zone ----
+    if (m_showZones && m_zoneTool == ZoneTool::NewZone && vp.isCanvasHovered()) {
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            m_zoneDragActive = true;
+            glm::vec2 c = vp.toContent(io.MousePos.x, io.MousePos.y);
+            m_zoneDragStartContent = c;
+        }
+        if (m_zoneDragActive && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            glm::vec2 c = vp.toContent(io.MousePos.x, io.MousePos.y);
+            const float x1 = std::min(m_zoneDragStartContent.x, c.x);
+            const float y1 = std::min(m_zoneDragStartContent.y, c.y);
+            const float x2 = std::max(m_zoneDragStartContent.x, c.x);
+            const float y2 = std::max(m_zoneDragStartContent.y, c.y);
+            if ((x2 - x1) > 2.f && (y2 - y1) > 2.f) {
+                plotter::MaintenanceZone z;
+                z.id   = m_zones.makeUniqueZoneId();
+                z.name = "Zone " + std::to_string((int)m_zones.zones.size() + 1);
+                const glm::vec2 m1 = bed.contentToMachine(x1, y1);
+                const glm::vec2 m2 = bed.contentToMachine(x2, y2);
+                z.x = m1.x;
+                z.y = m1.y;
+                z.w = m2.x - m1.x;
+                z.h = m2.y - m1.y;
+                m_zones.zones.push_back(std::move(z));
+                m_selectedZoneIdx = (int)m_zones.zones.size() - 1;
+                m_gcodeGen.setSelectedZoneIndex(m_selectedZoneIdx);
+                ofkitty::runtime().select(entt::null);
+                ofkitty::runtime().setWindowVisible("Properties", true);
+            }
+            m_zoneDragActive = false;
+        }
+        if (m_zoneDragActive) {
+            glm::vec2 c = vp.toContent(io.MousePos.x, io.MousePos.y);
+            ImVec2 s1 = vp.toScreen(m_zoneDragStartContent.x, m_zoneDragStartContent.y);
+            ImVec2 s2 = vp.toScreen(c.x, c.y);
+            dl->AddRect(s1, s2, IM_COL32(80, 200, 255, 180), 0.f, 0, 1.f);
+        }
+    }
 
-    // ---- Blit FBO into the ImGui panel ----
-    // GL FBOs store rows bottom-up; flip V so it appears right-side up in ImGui.
+    // ---- Selected zone transform handle (machine coords) ----
+    if (m_showZones && m_selectedZoneIdx >= 0
+        && m_selectedZoneIdx < (int)m_zones.zones.size()
+        && m_zoneTool == ZoneTool::Select)
     {
-        ImGui::SetCursorScreenPos(canvasOrigin);
-        ImTextureID tid = GetImTextureID(m_previewFbo.getTexture());
-        ImGui::Image(tid, ImVec2(canvasW, canvasH), ImVec2(0, 1), ImVec2(1, 0));
+        auto& z = m_zones.zones[m_selectedZoneIdx];
+        static ecs::TransformHandle2D s_zoneHandle;
+        const glm::vec2 ztl = bed.machineToContent(z.x, z.y);
+        ecs::Rect2D r { ztl.x, ztl.y, z.w, z.h };
+        auto toScr = [&](float cx, float cy) -> ImVec2 { return vp.toScreen(cx, cy); };
+        auto toCnt = [&](float sx, float sy) -> ImVec2 {
+            auto c = vp.toContent(sx, sy);
+            return { c.x, c.y };
+        };
+        s_zoneHandle.draw(dl, r, toScr, toCnt);
+        const glm::vec2 mtl = bed.contentToMachine(r.x, r.y);
+        z.x = mtl.x;
+        z.y = mtl.y;
+        z.w = r.w;
+        z.h = r.h;
     }
 
-    // ---- Image overlay selection (hit-test only — rendering is in FBO) ----
-    if (m_showImageOverlay) {
-        const float iox = m_engine.imageOverlayX, ioy = m_engine.imageOverlayY;
-        const float iow = m_engine.imageOverlayW, ioh = m_engine.imageOverlayH;
-        if (iow > 0.f && ioh > 0.f) {
-            ImVec2 imgTL(ox + iox * zoom,         oy + ioy * zoom);
-            ImVec2 imgBR(ox + (iox + iow) * zoom, oy + (ioy + ioh) * zoom);
+    // ---- Zone select / add position click ----
+    if (m_showZones && vp.isCanvasHovered()
+        && ImGui::IsMouseReleased(ImGuiMouseButton_Left)
+        && m_zoneTool != ZoneTool::NewZone)
+    {
+        ImVec2 drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+        if (drag.x * drag.x + drag.y * drag.y < 16.f) {
+            glm::vec2 c = vp.toContent(io.MousePos.x, io.MousePos.y);
+            const glm::vec2 m = bed.contentToMachine(c.x, c.y);
+            if (m_zoneTool == ZoneTool::AddPosition && m_selectedZoneIdx >= 0
+                && m_selectedZoneIdx < (int)m_zones.zones.size())
+            {
+                auto& z = m_zones.zones[m_selectedZoneIdx];
+                plotter::ZonePosition p;
+                p.x = m.x;
+                p.y = m.y;
+                p.positionIndex = (int)z.positions.size();
+                p.label = "pos" + std::to_string(p.positionIndex);
+                z.positions.push_back(p);
+            } else {
+                int hit = -1;
+                for (int zi = 0; zi < (int)m_zones.zones.size(); ++zi) {
+                    const auto& z = m_zones.zones[zi];
+                    if (m.x >= z.x && m.x <= z.x + z.w && m.y >= z.y && m.y <= z.y + z.h) {
+                        hit = zi;
+                    }
+                }
+                m_selectedZoneIdx = hit;
+                m_gcodeGen.setSelectedZoneIndex(hit);
+                m_selPathEntity = entt::null;
+                m_selPathIdx    = -1;
+                ofkitty::runtime().select(entt::null);
+                ofkitty::runtime().setWindowVisible("Properties", true);
+            }
+        }
+    }
 
-            // Select on mouse release so a drag doesn't accidentally select.
+    // ---- Image overlay hit-test and transform handle (paper coords → content) ----
+    if (m_showImageOverlay) {
+        const glm::vec2 imgTLc = paperToContentMM(
+            {m_engine.imageOverlayX, m_engine.imageOverlayY}, paperMM, paperOrg);
+        const glm::vec2 imgBRc = paperToContentMM(
+            {m_engine.imageOverlayX + m_engine.imageOverlayW,
+             m_engine.imageOverlayY + m_engine.imageOverlayH},
+            paperMM, paperOrg);
+        const float iox = imgTLc.x, ioy = imgTLc.y;
+        const float iow = imgBRc.x - imgTLc.x, ioh = imgBRc.y - imgTLc.y;
+        if (iow > 0.f && ioh > 0.f) {
+            ImVec2 imgTL = vp.toScreen(iox,       ioy);
+            ImVec2 imgBR = vp.toScreen(iox + iow, ioy + ioh);
+
             if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
                 ImVec2 mp   = ImGui::GetMousePos();
                 ImVec2 drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
-                bool   tiny = drag.x * drag.x + drag.y * drag.y < 16.f; // < 4px
+                bool   tiny = drag.x * drag.x + drag.y * drag.y < 16.f;
                 bool inside = mp.x >= imgTL.x && mp.x <= imgBR.x &&
                               mp.y >= imgTL.y && mp.y <= imgBR.y;
                 if (tiny) m_imageSelected = inside;
             }
         }
 
-        // 2D transform handle (only when selected and not locked)
         if (m_imageSelected && !m_imageOverlayLocked) {
             static ecs::TransformHandle2D s_imgHandle;
-            ecs::Rect2D r { m_engine.imageOverlayX, m_engine.imageOverlayY,
-                                 m_engine.imageOverlayW, m_engine.imageOverlayH };
-            auto toScreenHandle = [&](float cx, float cy) -> ImVec2 { return toScreen(cx, cy); };
-            auto toCanvasHandle = [&](float sx, float sy) -> ImVec2 {
-                auto mm = toMm(sx, sy);
-                return { mm.x, mm.y };
+            ecs::Rect2D r { iox, ioy, iow, ioh };
+            auto toScr = [&](float cx, float cy) -> ImVec2 { return vp.toScreen(cx, cy); };
+            auto toCnt = [&](float sx, float sy) -> ImVec2 {
+                auto c = vp.toContent(sx, sy); return { c.x, c.y };
             };
-            s_imgHandle.draw(dl, r, toScreenHandle, toCanvasHandle);
-            m_engine.imageOverlayX = r.x;  m_engine.imageOverlayY = r.y;
-            m_engine.imageOverlayW = r.w;  m_engine.imageOverlayH = r.h;
+            s_imgHandle.draw(dl, r, toScr, toCnt);
+            const glm::vec2 paperTL = contentToPaperMM({r.x, r.y}, paperMM, paperOrg);
+            m_engine.imageOverlayX = paperTL.x;
+            m_engine.imageOverlayY = paperTL.y;
+            m_engine.imageOverlayW = r.w;
+            m_engine.imageOverlayH = r.h;
         } else if (m_imageSelected && m_imageOverlayLocked) {
-            // Show a dashed outline to indicate the image is selected but locked.
-            const float iox2 = m_engine.imageOverlayX, ioy2 = m_engine.imageOverlayY;
-            const float iow2 = m_engine.imageOverlayW, ioh2 = m_engine.imageOverlayH;
-            ImVec2 sTL(ox + iox2 * zoom,         oy + ioy2 * zoom);
-            ImVec2 sTR(ox + (iox2+iow2) * zoom,  oy + ioy2 * zoom);
-            ImVec2 sBR(ox + (iox2+iow2) * zoom,  oy + (ioy2+ioh2) * zoom);
-            ImVec2 sBL(ox + iox2 * zoom,          oy + (ioy2+ioh2) * zoom);
+            const float iox2 = iox, ioy2 = ioy;
+            const float iow2 = iow, ioh2 = ioh;
+            ImVec2 sTL = vp.toScreen(iox2,        ioy2);
+            ImVec2 sTR = vp.toScreen(iox2 + iow2, ioy2);
+            ImVec2 sBR = vp.toScreen(iox2 + iow2, ioy2 + ioh2);
+            ImVec2 sBL = vp.toScreen(iox2,         ioy2 + ioh2);
             dl->AddQuad(sTL, sTR, sBR, sBL, IM_COL32(200, 200, 200, 160), 1.f);
         }
     }
 
-    // Click in canvas to select the nearest path (for inline path editor).
-    // Only act on a clean click (no drag, not over the image handle).
-    if (canvasHovered
+    // ---- Path selection on clean click ----
+    if (vp.isCanvasHovered()
         && ImGui::IsMouseReleased(ImGuiMouseButton_Left)
         && !m_imageSelected
-        && ImGui::GetMouseDragDelta(ImGuiMouseButton_Left).x * ImGui::GetMouseDragDelta(ImGuiMouseButton_Left).x
-         + ImGui::GetMouseDragDelta(ImGuiMouseButton_Left).y * ImGui::GetMouseDragDelta(ImGuiMouseButton_Left).y < 16.f)
+        && m_zoneTool == ZoneTool::Select)
     {
-        ImVec2 mp = io.MousePos;
-        auto [mmx, mmy] = toMm(mp.x, mp.y);
+        ImVec2 drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+        if (drag.x * drag.x + drag.y * drag.y < 16.f) {
+        glm::vec2 mm  = vp.toContent(io.MousePos.x, io.MousePos.y);
+        glm::vec2 pap = contentToPaperMM(mm, paperMM, paperOrg);
+        float mmx = pap.x, mmy = pap.y;
 
-        // Find the flat path whose nearest segment is closest to the click.
-        const auto& fpaths     = paths;  // already retrieved at top of drawPreviewPanel
         const auto& fentities  = m_engine.getFlatPathEntities();
-        float bestDist2 = 100.f * 100.f / (zoom * zoom);  // ~100 screen px threshold
+        float bestDist2 = 100.f * 100.f / (zoom * zoom);
         int   bestFlat  = -1;
         for (int fi = 0; fi < (int)fpaths.size(); ++fi) {
-            const auto& poly = fpaths[fi];
-            const auto& verts = poly.getVertices();
+            const auto& verts = fpaths[fi].getVertices();
             for (size_t vi = 0; vi + 1 < verts.size(); ++vi) {
-                // Closest point on segment to (mmx, mmy)
                 float ax = verts[vi].x, ay = verts[vi].y;
                 float bx = verts[vi+1].x, by = verts[vi+1].y;
                 float dx = bx - ax, dy = by - ay;
                 float len2 = dx*dx + dy*dy;
-                float t = len2 > 0 ? std::max(0.f, std::min(1.f, ((mmx-ax)*dx + (mmy-ay)*dy) / len2)) : 0.f;
-                float cx2 = ax + t*dx - mmx, cy2 = ay + t*dy - mmy;
-                float d2 = cx2*cx2 + cy2*cy2;
+                float t = len2 > 0 ? std::clamp(((mmx-ax)*dx+(mmy-ay)*dy)/len2, 0.f, 1.f) : 0.f;
+                float ex = ax+t*dx-mmx, ey = ay+t*dy-mmy;
+                float d2 = ex*ex + ey*ey;
                 if (d2 < bestDist2) { bestDist2 = d2; bestFlat = fi; }
             }
         }
@@ -894,16 +1262,13 @@ void ofApp::drawPreviewPanel(bool& visible)
         if (bestFlat >= 0) {
             entt::entity layerEnt = (bestFlat < (int)fentities.size())
                                   ? fentities[bestFlat] : entt::null;
-            // Map flat index → per-layer path index via paths_component order.
             int pathIdx = -1;
             if (m_engine.registry.valid(layerEnt)) {
                 auto& pc = m_engine.registry.get<plotter::paths_component>(layerEnt);
-                // Count how many flat paths come from earlier layers to find offset.
                 int offset = 0;
                 for (int fi2 = 0; fi2 < bestFlat; ++fi2)
-                    if ((fi2 < (int)fentities.size()) && fentities[fi2] == layerEnt)
+                    if (fi2 < (int)fentities.size() && fentities[fi2] == layerEnt)
                         ++offset;
-                // Count outlines per path until we reach offset.
                 int count = 0;
                 for (int pi = 0; pi < (int)pc.paths.size(); ++pi) {
                     int ol = (int)pc.paths[pi].getOutline().size();
@@ -911,12 +1276,10 @@ void ofApp::drawPreviewPanel(bool& visible)
                     count += ol;
                 }
             }
-
             if (layerEnt != entt::null && pathIdx >= 0) {
                 m_selPathEntity = layerEnt;
                 m_selPathIdx    = pathIdx;
                 auto& pc = m_engine.registry.get<plotter::paths_component>(layerEnt);
-                // Convert selected ofPath into ImVectorEditor::Path for inline editing.
                 m_editPath.clear();
                 m_editConfig.tool = ImVectorEditor::Tool::Select;
                 for (const auto& cmd : pc.paths[pathIdx].getCommands()) {
@@ -939,31 +1302,35 @@ void ofApp::drawPreviewPanel(bool& visible)
                     }
                 }
                 m_engine.activeLayer = layerEnt;
+                m_selectedZoneIdx  = -1;
+                m_gcodeGen.setSelectedZoneIndex(-1);
+                ofkitty::runtime().select(layerEnt);
+                ofkitty::runtime().setWindowVisible("Properties", true);
             }
         } else {
-            // Click on empty space — deselect.
             m_selPathEntity = entt::null;
             m_selPathIdx    = -1;
             ofkitty::runtime().select(entt::null);
         }
-    }
+        } // end drag-check
+    }   // end isCanvasHovered click block
 
-    // Inline vector editor — draws anchor handles over the selected path and
-    // writes any changes immediately back to plotter::paths_component.
+    // ---- Inline path editor ----
     if (m_selPathEntity != entt::null && m_selPathIdx >= 0
-        && m_engine.registry.valid(m_selPathEntity)) {
-
-        // Sync transform every frame so pan/zoom stays in lock-step with the preview.
-        m_editConfig.canvasSize             = ImVec2(canvasW, canvasH);
+        && m_engine.registry.valid(m_selPathEntity))
+    {
+        m_editConfig.canvasSize             = ImVec2(vp.canvasW(), vp.canvasH());
         m_editConfig.showGrid               = false;
         m_editConfig.allowKeyboardShortcuts = false;
-        m_editConfig.style.backgroundColor  = IM_COL32(0, 0, 0, 0);  // transparent
+        m_editConfig.style.backgroundColor  = IM_COL32(0, 0, 0, 0);
         m_editConfig.style.pathColor        = IM_COL32(255, 200, 50, 200);
         m_editConfig.style.previewColor     = IM_COL32(255, 200, 50, 80);
         m_editConfig.transform.zoom         = zoom;
-        m_editConfig.transform.pan          = ImVec2(ox - canvasOrigin.x, oy - canvasOrigin.y);
-
-        ImGui::SetCursorScreenPos(canvasOrigin);
+        const glm::vec2 paperOrgScr = paperToContentMM({0.f, 0.f}, paperMM, paperOrg);
+        m_editConfig.transform.pan          = ImVec2(vp._ox - vp._canvasOx + paperOrgScr.x * zoom,
+                                                     vp._oy - vp._canvasOy + paperOrgScr.y * zoom);
+        if (m_yAxisUp) m_editConfig.transform.pan.y += paperMM.y * zoom;
+        ImGui::SetCursorScreenPos(vp.canvasOriginPx());
         auto res = m_pathEditor.Draw("##pathEdit", m_editPath, m_editConfig);
 
         if (res.changed) {
@@ -989,7 +1356,6 @@ void ofApp::drawPreviewPanel(bool& visible)
             }
         }
 
-        // Escape to deselect.
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             m_selPathEntity = entt::null;
             m_selPathIdx    = -1;
@@ -997,46 +1363,20 @@ void ofApp::drawPreviewPanel(bool& visible)
         }
     }
 
-    // Margin rectangle — paper inset by m_engine.marginMM on all four sides.
-    // Drawn over paths so the printable boundary stays visible; the canvas
-    // clip rect (still active here) prevents bleed into the ruler strips.
-    if (ofkitty::runtime().showMarginRect() && m_engine.marginMM > 0.f
+    // ---- Margin rectangle (paper space → content) ----
+    if (m_showMargin && m_engine.marginMM > 0.f
         && paperMM.x > 2.f * m_engine.marginMM
         && paperMM.y > 2.f * m_engine.marginMM)
     {
         const float mm = m_engine.marginMM;
-        const ImVec2 marginTL(ox + mm * zoom, oy + mm * zoom);
-        const ImVec2 marginBR(ox + (paperMM.x - mm) * zoom,
-                              oy + (paperMM.y - mm) * zoom);
-        const ofColor& mc = ofkitty::runtime().marginColor();
+        const glm::vec2 mtl = paperToContentMM({mm, mm}, paperMM, paperOrg);
+        const glm::vec2 mbr = paperToContentMM({paperMM.x - mm, paperMM.y - mm}, paperMM, paperOrg);
         ofkitty::drawMarginRect(
-            dl, marginTL, marginBR,
-            IM_COL32(mc.r, mc.g, mc.b, mc.a),
-            1.f);
-    }
-
-    dl->PopClipRect();
-
-    // ---- Rulers (drawn unclipped so strips reach window edges) ----
-    if (m_showPreviewRulers && zoom > 0.f) {
-        // scrollPx tells the ruler where tick-0 (the paper top-left) is
-        // relative to the ruler's content-area origin (canvasOrigin).
-        const float scrollX = ox - canvasOrigin.x;
-        const float scrollY = oy - canvasOrigin.y;
-        ofkitty::drawRulersInRegion(
             dl,
-            windowOrigin,                    // ruler corner = window content top-left
-            fullAvail,                       // strips span the entire content area
-            io.MousePos,
-            useMM ? zoom : 1.0f,
-            useMM ? "mm" : "px",
-            ofkitty::runtime().uiScale(),
-            prefs.rulerScale,
-            &m_guides,
-            ImVec2(scrollX, scrollY));
+            vp.toScreen(mtl.x, mtl.y),
+            vp.toScreen(mbr.x, mbr.y),
+            IM_COL32(m_marginColor.r, m_marginColor.g, m_marginColor.b, m_marginColor.a), 1.f);
     }
-
-    ImGui::End();
 }
 
 // ============================================================================
@@ -1074,5 +1414,11 @@ void ofApp::startGenerate()
 void ofApp::sendToPlotter()
 {
     if (m_engine.getPaths().empty()) return;
-    m_sender.enqueueGCodeBlock(plotter::toGCode(m_engine));
+    auto opts = exportOptions();
+    const std::string gcode = plotter::toGCode(m_engine, opts);
+    if (opts.hasPipelineReport)
+        m_gcodeGen.setLastPipelineReport(opts.lastPipelineReport, true);
+    ofkitty::runtime().codeEditorSetText(gcode, TextEditor::LanguageDefinitionId::Gcode);
+    ofkitty::runtime().setWindowVisible("Code Editor", true);
+    m_sender.enqueueGCodeBlock(gcode);
 }
