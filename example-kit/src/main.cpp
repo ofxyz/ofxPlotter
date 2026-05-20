@@ -5,7 +5,7 @@
 int main()
 {
     ofGLWindowSettings settings;
-    settings.setSize(1280, 800);
+    settings.setSize(1600, 1000);
     settings.windowMode = OF_WINDOW;
     auto window = ofCreateWindow(settings);
     auto app    = std::make_shared<ofApp>();
